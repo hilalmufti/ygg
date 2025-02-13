@@ -1,18 +1,28 @@
 (require
-  hyrule [-> loop defmain])
+ hyrule [-> loop defmain])
 
-(import 
+(import
  socket
- toolz [first drop count cons assoc]
+ ssl
  hy
- hyrule [recur])
+ hyrule [recur]
+ toolz [first drop count cons assoc])
 
 
-(setv *newline* "\r\n")
-(setv *http-port* 80)
+(defmacro def [#* xs]
+  `(setv ~@xs))
+
+(defmacro assert-in [x xs]
+  `(assert (in ~x ~xs)))
+
+(def *newline* "\r\n")
+(def *http-port* 80)
+(def *https-port* 443)
+
 
 (defn rest [xs]
   (drop 1 xs))
+
 
 (defn second [xs]
   (get xs 1))
@@ -32,8 +42,23 @@
 (defn newline? [s]
   (= s *newline*))
 
+
 (defn split-scheme [s]
   (.split s "://" 1))
+
+(defn http? [s]
+  (or (= s "http") (= s 'http)))
+
+
+(defn https? [s]
+  (or (= s "https") (= s 'https)))
+
+
+(defn scheme->port [scheme]
+  (cond
+    (http? scheme) *http-port*
+    (https? scheme) *https-port*))
+
 
 (defn split-host [s]
   (.split
@@ -41,17 +66,37 @@
    "/"
    1))
 
+
+(defn has-port? [host]
+  (in ":" host))
+
+
+(defn split-port [host]
+  (.split host ":" 1))
+
+
 (defn parse-url [s]
   (let [[scheme rest] (split-scheme s)
-        [host path] (split-host rest)]
-    [scheme host (+ "/" path)]))
-
-(defn make-url [scheme host path]
-  (assert (= scheme "http"))
-  ['url scheme host path])
+        [host path] (split-host rest)
+        [host port] (if (has-port? host) (split-port host) [host (scheme->port scheme)])]
+    [scheme host (+ "/" path) (int port)]))
 
 
-(setv make-socket socket.socket)
+(defn make-url [scheme host path port]
+  (assert-in scheme ["http" "https"])
+  ['url scheme host path port])
+
+
+(defn str->url [s]
+  (make-url #* (parse-url s)))
+
+
+(def make-socket socket.socket)
+
+
+(defn make-secure-socket [family type proto host]
+  (let [ctx (ssl.create_default_context)]
+    (.wrap_socket ctx (make-socket family type proto) :server_hostname host)))
 
 
 (defn utf8 [s]
@@ -79,8 +124,8 @@
 
 
 (defn version->str [version]
-    (let [[_ major minor] version]
-        (+ "HTTP/" (str major) "." (str minor))))
+  (let [[_ major minor] version]
+    (+ "HTTP/" (str major) "." (str minor))))
 
 ; TODO: add invariant checking for everything
 (defn make-request-line [method path version]
@@ -110,7 +155,7 @@
 
 
 (defn make-request [request-line header-line]
-    ['request request-line header-line])
+  ['request request-line header-line])
 
 (defn make-get-request [path host]
   (make-request (make-request-line-get path) (make-header-line "Host" host)))
@@ -126,7 +171,7 @@
 
 
 (defn send-request [s r] ; socket request
-    (.send s (request->utf8 r)))
+  (.send s (request->utf8 r)))
 
 
 (defn split-status-line [s]
@@ -135,6 +180,7 @@
 
 (defn parse-header [s]
   (-> s .strip .casefold make-symbol))
+
 
 (defn parse-status-line [s]
   (let [[version status explanation] (split-status-line s)]
@@ -167,9 +213,6 @@
 (defmacro match* []
   '())
 
-(defmacro def [#* xs]
-  `(setv ~@xs))
-
 (defmacro when-in [x xs #* body]
   `(when (in ~x ~xs) ~@body))
 
@@ -179,30 +222,32 @@
 
 
 ; TODO: add response?
-(defmacro with-socket [ss a #* body]
-  (let [[s family type proto] ss]
+; TODO: support for more addresses
+(defmacro with-socket [ss a scheme #* body]
+  (let [[s family type proto] ss
+        [host port] a]
     `(try
-       (with [~s (make-socket ~family ~type ~proto)]
-         (.connect ~s ~a)
-         ~@body)
+       (let [sock# (if (https? ~scheme)
+                     (make-secure-socket ~family ~type ~proto ~host) 
+                     (make-socket ~family ~type ~proto))]
+         (with [~s sock#]
+           (.connect ~s ~a)
+           ~@body))
        (finally
          (.close ~s)))))
-
-
 
 ; TODO: How do you implement sockets?
 ; TODO: simplify
 (defn url-request [url]
-  (def [_ scheme host path] url)
-  (with-socket [s socket.AF_INET socket.SOCK_STREAM socket.IPPROTO_TCP] #(host *http-port*)
+  (def [_ scheme host path port] url)
+  (with-socket [s socket.AF_INET socket.SOCK_STREAM socket.IPPROTO_TCP] #(host port) scheme
     (send-request s (make-get-request path host))
     (let [response (.makefile s "r" :encoding "utf8" :newline *newline*)
           hs (-> response response->lines parse-lines)
           content (.read response)]
       ; (print-when (in 'transfer-encoding hs) "warning: transfer-encoding") ; TODO
       ; (print-when (in 'content-length hs) "warning: content-length")
-      content)
-    ))
+      content)))
 
 (defn parse-text [body]
   (loop [[xs (list body)] [tag? False] [acc []] [accs []]]
@@ -211,8 +256,7 @@
       ["<" #* xs]  (recur xs True [] (if acc (cons (.join "" (reverse acc)) accs) accs))
       [">" #* xs] (recur xs False acc accs)
       [x #* xs] :if (not tag?) (recur xs tag? (cons x acc) accs)
-      [x #* xs] (recur xs tag? acc accs)
-      )))
+      [x #* xs] (recur xs tag? acc accs))))
 
 
 (defn request-text [url]
@@ -228,8 +272,10 @@
 
 
 (defmain [browser url]
-  (load (make-url #* (parse-url url))))
+  (-> url str->url load))
 
 
 (def url-string "http://example.org/index.html")
-(def url (make-url #* (parse-url url-string)))
+(def url-string-secure "https://example.org/index.html")
+(def url (str->url url-string))
+(def url-secure (str->url url-string-secure))
