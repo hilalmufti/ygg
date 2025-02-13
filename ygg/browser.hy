@@ -1,5 +1,5 @@
 (require
-  hyrule [-> loop])
+  hyrule [-> loop defmain])
 
 (import 
  socket
@@ -21,6 +21,9 @@
   (list (reversed (list xs))))
 
 (setv make-symbol hy.models.Symbol)
+
+(defn list->str [xs]
+  (.join "" xs))
 
 ; TODO: write my own split
 (defn split [s sep]
@@ -83,6 +86,9 @@
 (defn make-request-line [method path version]
   ['request-line method path version])
 
+(defn make-request-line-get [path]
+  (make-request-line 'get path (make-version 1 0)))
+
 
 (defn request-line->str [request-line]
   (let [[_ method path version] request-line]
@@ -105,6 +111,9 @@
 
 (defn make-request [request-line header-line]
     ['request request-line header-line])
+
+(defn make-get-request [path host]
+  (make-request (make-request-line-get path) (make-header-line "Host" host)))
 
 
 (defn request->str [request]
@@ -136,6 +145,7 @@
   ['status-line version status explanation])
 
 
+; TODO: return stream
 (defn response->lines [r]
   (loop [[acc []]]
     (match (.readline r)
@@ -153,22 +163,73 @@
 (defmacro with-socket []
   '())
 
+; TODO
+(defmacro match* []
+  '())
+
+(defmacro def [#* xs]
+  `(setv ~@xs))
+
+(defmacro when-in [x xs #* body]
+  `(when (in ~x ~xs) ~@body))
+
+
+(defmacro print-when [test #* xs]
+  `(when ~test (print ~@xs)))
+
+
+; TODO: add response?
+(defmacro with-socket [ss a #* body]
+  (let [[s family type proto] ss]
+    `(try
+       (with [~s (make-socket ~family ~type ~proto)]
+         (.connect ~s ~a)
+         ~@body)
+       (finally
+         (.close ~s)))))
+
+
+
 ; TODO: How do you implement sockets?
+; TODO: simplify
 (defn url-request [url]
-  (let [[_ scheme host path] url
-        s (make-socket socket.AF_INET socket.SOCK_STREAM socket.IPPROTO_TCP)
-        r (make-request (make-request-line 'get path (make-version 1 0)) (make-header-line "Host" host))]
-    (.connect s #(host *http-port*))
-    (send-request s r)
+  (def [_ scheme host path] url)
+  (with-socket [s socket.AF_INET socket.SOCK_STREAM socket.IPPROTO_TCP] #(host *http-port*)
+    (send-request s (make-get-request path host))
     (let [response (.makefile s "r" :encoding "utf8" :newline *newline*)
           hs (-> response response->lines parse-lines)
           content (.read response)]
-      (print hs)
-    ;   (assert (not (in 'transfer-encoding hs))) ; TODO
-    ;   (assert (not (in 'content-length hs))) ; TODO
-      (.close s)
-      content)))
+      ; (print-when (in 'transfer-encoding hs) "warning: transfer-encoding") ; TODO
+      ; (print-when (in 'content-length hs) "warning: content-length")
+      content)
+    ))
+
+(defn parse-text [body]
+  (loop [[xs (list body)] [tag? False] [acc []] [accs []]]
+    (match xs
+      [] (reverse accs)
+      ["<" #* xs]  (recur xs True [] (if acc (cons (.join "" (reverse acc)) accs) accs))
+      [">" #* xs] (recur xs False acc accs)
+      [x #* xs] :if (not tag?) (recur xs tag? (cons x acc) accs)
+      [x #* xs] (recur xs tag? acc accs)
+      )))
 
 
-(setv url-string "http://example.org/index.html")
-(setv url (make-url #* (parse-url url-string)))
+(defn request-text [url]
+  (-> url url-request parse-text))
+
+
+(defn show [body]
+  (-> body parse-text list->str print))
+
+
+(defn load [url]
+  (show (url-request url)))
+
+
+(defmain [browser url]
+  (load (make-url #* (parse-url url))))
+
+
+(def url-string "http://example.org/index.html")
+(def url (make-url #* (parse-url url-string)))
